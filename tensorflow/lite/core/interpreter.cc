@@ -19,6 +19,7 @@ limitations under the License.
 #include <stdint.h>
 #include <stdlib.h>
 
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <memory>
@@ -29,9 +30,12 @@ limitations under the License.
 #include "ruy/denormal.h"  // from @ruy
 #include "tensorflow/compiler/mlir/lite/allocation.h"
 #include "tensorflow/compiler/mlir/lite/experimental/remat/metadata_util.h"
+#include "tensorflow/lite/builtin_ops.h"
 #include "tensorflow/lite/core/api/error_reporter.h"
 #include "tensorflow/lite/core/api/profiler.h"
+#include "tensorflow/lite/core/c/builtin_op_data.h"
 #include "tensorflow/lite/core/c/c_api_types.h"
+#include "tensorflow/lite/core/c/common.h"
 #include "tensorflow/lite/core/signature_runner.h"
 #include "tensorflow/lite/core/subgraph.h"
 #include "tensorflow/lite/external_cpu_backend_context.h"
@@ -97,6 +101,68 @@ TfLiteQuantization GetQuantizationFromLegacy(
                                      static_cast<int64_t>(status));         \
     TF_LITE_ENSURE_STATUS(status);                                          \
   } while (0)
+
+// Appends to `callees` the subgraph indices that `node` may invoke, read from
+// the builtin params of the ops that reference subgraphs. Nodes of other ops,
+// including custom ops, contribute nothing. STABLEHLO_WHILE, STABLEHLO_REDUCE
+// and STABLEHLO_SORT also carry subgraph references in the schema, but the
+// runtime neither parses their options nor provides kernels for them.
+void AppendCalleeSubgraphIndices(const TfLiteNode& node,
+                                 const TfLiteRegistration& registration,
+                                 std::vector<int>* callees) {
+  const void* params = node.builtin_data;
+  if (params == nullptr) return;
+  switch (registration.builtin_code) {
+    case kTfLiteBuiltinIf: {
+      const auto* if_params = static_cast<const TfLiteIfParams*>(params);
+      callees->push_back(if_params->then_subgraph_index);
+      callees->push_back(if_params->else_subgraph_index);
+      break;
+    }
+    case kTfLiteBuiltinWhile: {
+      const auto* while_params = static_cast<const TfLiteWhileParams*>(params);
+      callees->push_back(while_params->cond_subgraph_index);
+      callees->push_back(while_params->body_subgraph_index);
+      break;
+    }
+    case kTfLiteBuiltinCallOnce: {
+      callees->push_back(static_cast<const TfLiteCallOnceParams*>(params)
+                             ->init_subgraph_index);
+      break;
+    }
+    case kTfLiteBuiltinStablehloCase: {
+      const auto* case_params =
+          static_cast<const TfLiteStablehloCaseParams*>(params);
+      const uint32_t num_branches =
+          std::min<uint32_t>(case_params->num_branches,
+                             TFLITE_STABLEHLO_CASE_PARAMS_MAX_BRANCHES_COUNT);
+      for (uint32_t i = 0; i < num_branches; ++i) {
+        callees->push_back(case_params->branch_subgraph_indices[i]);
+      }
+      break;
+    }
+    case kTfLiteBuiltinStablehloComposite: {
+      callees->push_back(
+          static_cast<const TfLiteStablehloCompositeParams*>(params)
+              ->subgraph_index);
+      break;
+    }
+    case kTfLiteBuiltinStablehloReduceWindow: {
+      callees->push_back(
+          static_cast<const TfLiteStablehloReduceWindowParams*>(params)
+              ->body_subgraph_index);
+      break;
+    }
+    case kTfLiteBuiltinStablehloScatter: {
+      callees->push_back(
+          static_cast<const TfLiteStablehloScatterParams*>(params)
+              ->update_computation_subgraph_index);
+      break;
+    }
+    default:
+      break;
+  }
+}
 
 }  // namespace
 
@@ -331,7 +397,26 @@ TfLiteStatus Interpreter::SetNumThreads(int num_threads) {
 }
 
 TfLiteStatus Interpreter::ApplyLazyDelegateProviders() {
-  if (lazy_delegate_providers_.empty() || IsFullyDelegated()) return kTfLiteOk;
+  if (lazy_delegate_providers_.empty()) return kTfLiteOk;
+
+  // If delegation was scoped to specific signatures via
+  // ModifyGraphWithDelegateForSignature, scope the default delegates to the
+  // subgraphs reachable from those signatures too. Otherwise they are applied
+  // to all subgraphs unless the primary subgraph is already fully delegated.
+  std::vector<int> scoped_subgraph_indices;
+  if (delegation_scope_root_subgraph_indices_.empty()) {
+    if (IsFullyDelegated()) return kTfLiteOk;
+  } else {
+    const bool all_roots_fully_delegated =
+        std::all_of(delegation_scope_root_subgraph_indices_.begin(),
+                    delegation_scope_root_subgraph_indices_.end(),
+                    [this](int subgraph_index) {
+                      return subgraphs_[subgraph_index]->IsFullyDelegated();
+                    });
+    if (all_roots_fully_delegated) return kTfLiteOk;
+    TF_LITE_ENSURE_STATUS(GetReachableSubgraphIndicesImpl(
+        delegation_scope_root_subgraph_indices_, &scoped_subgraph_indices));
+  }
 
   // We only apply lazy delegate providers once.
   TfLiteDelegateCreators delegate_providers;
@@ -340,6 +425,13 @@ TfLiteStatus Interpreter::ApplyLazyDelegateProviders() {
   TFLITE_LOG(TFLITE_LOG_INFO,
              "Applying %zu TensorFlow Lite delegate(s) lazily.",
              delegate_providers.size());
+  if (!scoped_subgraph_indices.empty()) {
+    TFLITE_LOG(TFLITE_LOG_INFO,
+               "Restricting lazily applied delegate(s) to %zu of %zu "
+               "subgraph(s), as selected by "
+               "ModifyGraphWithDelegateForSignature.",
+               scoped_subgraph_indices.size(), subgraphs_.size());
+  }
   // At the moment, XNNPACK delegate is the only one that might be applied
   // by default, in which case, the execution will fall back to default
   // implementation if the XNNPACK delegate fails to be applied.
@@ -349,7 +441,11 @@ TfLiteStatus Interpreter::ApplyLazyDelegateProviders() {
     // tflite::MaybeCreateXNNPACKDelegate(...)) will return a nullptr.
     // Therefore, we simply continue with the next one.
     if (delegate_ptr == nullptr) continue;
-    auto status = ModifyGraphWithDelegateImpl(std::move(delegate_ptr));
+    TfLiteDelegate* delegate = TakeDelegateOwnership(std::move(delegate_ptr));
+    const TfLiteStatus status =
+        scoped_subgraph_indices.empty()
+            ? ModifyGraphWithDelegateImpl(delegate)
+            : ModifyGraphWithDelegateImpl(delegate, scoped_subgraph_indices);
     switch (status) {
       case kTfLiteOk:
         TFLITE_LOG(
@@ -455,6 +551,83 @@ TfLiteStatus Interpreter::ModifyGraphWithDelegateImpl(
     TF_LITE_ENSURE_STATUS(RemoveAllDelegates());
   }
   return status;
+}
+
+TfLiteStatus Interpreter::GetReachableSubgraphIndicesImpl(
+    const std::vector<int>& root_subgraph_indices,
+    std::vector<int>* reachable_subgraph_indices) const {
+  if (reachable_subgraph_indices == nullptr) {
+    TF_LITE_REPORT_ERROR(error_reporter_,
+                         "Reachable subgraph indices output must not be null.");
+    return kTfLiteApplicationError;
+  }
+  if (root_subgraph_indices.empty()) {
+    TF_LITE_REPORT_ERROR(error_reporter_,
+                         "Root subgraph indices must not be empty.");
+    return kTfLiteApplicationError;
+  }
+
+  const int num_subgraphs = static_cast<int>(subgraphs_.size());
+  std::vector<bool> is_reachable(num_subgraphs, false);
+  std::vector<int> pending;
+  pending.reserve(num_subgraphs);
+  for (int root : root_subgraph_indices) {
+    if (root < 0 || root >= num_subgraphs) {
+      TF_LITE_REPORT_ERROR(error_reporter_,
+                           "Root subgraph index %d is out of range.", root);
+      return kTfLiteApplicationError;
+    }
+    if (!is_reachable[root]) {
+      is_reachable[root] = true;
+      pending.push_back(root);
+    }
+  }
+
+  // Each subgraph is enqueued at most once, so the traversal is linear in the
+  // total number of nodes and terminates on recursive references.
+  std::vector<int> callees;
+  while (!pending.empty()) {
+    const int caller = pending.back();
+    pending.pop_back();
+    const Subgraph& subgraph = *subgraphs_[caller];
+    // Read the original (pre-delegation) nodes so that the result does not
+    // depend on which delegates have been applied; delegate kernels hide the
+    // nodes they replace from the current execution plan.
+    const std::vector<int>& plan =
+        subgraph.pre_delegation_execution_plan().empty()
+            ? subgraph.execution_plan()
+            : subgraph.pre_delegation_execution_plan();
+    for (int node_index : plan) {
+      const auto* node_and_registration =
+          subgraph.node_and_registration(node_index);
+      if (node_and_registration == nullptr) continue;
+      callees.clear();
+      AppendCalleeSubgraphIndices(node_and_registration->first,
+                                  node_and_registration->second, &callees);
+      for (int callee : callees) {
+        if (callee < 0 || callee >= num_subgraphs) {
+          TF_LITE_REPORT_ERROR(
+              error_reporter_,
+              "Node %d in subgraph %d references invalid subgraph index %d.",
+              node_index, caller, callee);
+          return kTfLiteError;
+        }
+        if (!is_reachable[callee]) {
+          is_reachable[callee] = true;
+          pending.push_back(callee);
+        }
+      }
+    }
+  }
+
+  reachable_subgraph_indices->clear();
+  for (int subgraph_index = 0; subgraph_index < num_subgraphs;
+       ++subgraph_index) {
+    if (is_reachable[subgraph_index]) {
+      reachable_subgraph_indices->push_back(subgraph_index);
+    }
+  }
+  return kTfLiteOk;
 }
 
 TfLiteStatus Interpreter::RemoveAllDelegates() {
@@ -571,9 +744,11 @@ impl::SignatureRunner* Interpreter::GetSignatureRunner(
     return &(iter->second);
   }
 
-  // Default delegates are applied once for all subgraphs. Only returns error
-  // when the status is kTfLiteError. For other statuses, it will fall back to
-  // the default implementation.
+  // Default delegates are applied once, to all subgraphs or, if
+  // ModifyGraphWithDelegateForSignature was used, to the subgraphs reachable
+  // from the selected signatures. Only returns error when the status is
+  // kTfLiteError. For other statuses, it will fall back to the default
+  // implementation.
   if (ApplyLazyDelegateProviders() == kTfLiteError) {
     return nullptr;
   }
