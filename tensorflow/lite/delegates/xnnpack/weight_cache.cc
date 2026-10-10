@@ -164,6 +164,7 @@ bool WeightCacheBuilder::StartBuildStep() {
   XNNPACK_RETURN_CHECK(!is_build_step_.exchange(true),
                        "Failed to start build step: already started. This may "
                        "be a concurrency issue.");
+  ScopeGuard reset_build_step_on_fail([this] { is_build_step_ = false; });
 
   // Reload flatbuffer data.
   XNNPackCacheHeader header;
@@ -188,6 +189,7 @@ bool WeightCacheBuilder::StartBuildStep() {
   build_segment_start_ = fd_.SetPos(header.buffer_list_offset);
   XNNPACK_RETURN_CHECK(build_segment_start_ != -1);
 
+  reset_build_step_on_fail.Deactivate();
   return true;
 }
 
@@ -272,6 +274,11 @@ bool WeightCacheBuilder::StopBuildStep() {
   XNNPACK_RETURN_CHECK(is_build_step_,
                        "Attempting to stop a non existing build step. This may "
                        "be a concurrency issue.");
+  ScopeGuard cleanup_build_step([this] {
+    data_.reset(nullptr);
+    capacity_ = 0;
+    is_build_step_ = false;
+  });
   XNNPACK_RETURN_CHECK(fd_.IsValid(), "cache file ('%s') is not open.",
                        file_path_.c_str());
 
@@ -313,7 +320,6 @@ bool WeightCacheBuilder::StopBuildStep() {
   TFLITE_LOG_PROD(tflite::TFLITE_LOG_VERBOSE,
                   "XNNPack weight cache: written to '%s'.", file_path_.c_str());
   first_write_done_ = true;
-  is_build_step_ = false;
   return true;
 }
 
@@ -688,6 +694,30 @@ bool MMapWeightCacheProvider::MapTensorIdentifiers(
     const TfLiteTensor& t = tensors[index];
     XNNPACK_RETURN_CHECK(MapBufferIdentifier(t.data.data, t.bytes, identifier));
   }
+  if (IsInMemoryCachePath(file_path_) && tensors != nullptr) {
+    // In-memory weight caches never serialize across processes, so constant
+    // tensors constructed programmatically without a FlatBuffer buffer table
+    // entry (e.g., in C++ unit tests or runtime-generated graphs) can safely
+    // use their tagged address as a synthetic identifier with size=0 (avoiding
+    // MADV_PAGEOUT on stack/heap buffers).
+    constexpr uint64_t kSyntheticBufferIdTag = uint64_t{1} << 63;
+    for (size_t i = 0; i < size; ++i) {
+      if (tensor_index_to_identifier.find(i) !=
+          tensor_index_to_identifier.end()) {
+        continue;
+      }
+      const TfLiteTensor& t = tensors[i];
+      if (t.allocation_type == kTfLiteMmapRo && t.data.data != nullptr &&
+          buffer_address_to_identifier_.find(t.data.data) ==
+              buffer_address_to_identifier_.end()) {
+        const uint64_t synthetic_id =
+            (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(t.data.data)) |
+             kSyntheticBufferIdTag);
+        XNNPACK_RETURN_CHECK(
+            MapBufferIdentifier(t.data.data, /*size=*/0, synthetic_id));
+      }
+    }
+  }
   return true;
 }
 
@@ -825,7 +855,7 @@ enum xnn_status MMapWeightCacheProvider::alias_data(void* context, void* alias,
 
 PackIdentifier MMapWeightCacheProvider::BuildPackIdentifier(
     const xnn_weights_cache_look_up_key& key) {
-  const auto get_buffer_id = [&](const void* buffer) -> size_t {
+  const auto get_buffer_id = [&](const void* buffer) -> uint64_t {
     if (!buffer) {
       return PackIdentifier::kNoId;
     }
