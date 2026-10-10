@@ -296,6 +296,8 @@ TEST_F(WeightCacheBuilderTest, MultipleStepBuild) {
   }
 
   ASSERT_TRUE(builder.StopBuildStep());
+  EXPECT_EQ(builder.capacity(), 0);
+  EXPECT_EQ(builder.data(), nullptr);
 
   MMapHandle handle;
   ASSERT_TRUE(handle.Map(tmp_file.GetCPath()));
@@ -312,6 +314,8 @@ TEST_F(WeightCacheBuilderTest, MultipleStepBuild) {
   }
 
   ASSERT_TRUE(builder.StopBuildStep());
+  EXPECT_EQ(builder.capacity(), 0);
+  EXPECT_EQ(builder.data(), nullptr);
 
   ASSERT_TRUE(handle.Map(tmp_file.GetCPath()));
 
@@ -1326,6 +1330,55 @@ TEST_F(MaliciousCacheTest, BufferOffsetPlusSizeOverflowsInt64) {
 
   MMapWeightCacheProvider cache_provider;
   EXPECT_FALSE(cache_provider.Load(fd_.GetCPath()));
+}
+
+TEST(InMemoryMultiSubgraphWeightCacheTest,
+     MultiStepAllCacheHitsResetsBuildStepAndDeduplicatesSyntheticBuffers) {
+  if (!TfLiteXNNPackDelegateCanUseInMemoryWeightCacheProvider()) {
+    GTEST_SKIP() << "In-memory weight cache isn't supported on this system.";
+  }
+  xnn_set_fingerprint(kDefaultFingerprint);
+
+  MMapWeightCacheProvider cache_provider;
+  ASSERT_TRUE(cache_provider.LoadOrStartBuild(kInMemoryCachePath));
+
+  const char shared_kernel[] = "Shared multi-subgraph packed weight payload.";
+  TfLiteTensor tensor{};
+  tensor.allocation_type = kTfLiteMmapRo;
+  tensor.data.data = const_cast<char*>(shared_kernel);
+  tensor.bytes = sizeof(shared_kernel);
+
+  // Subgraph 0 build step: map synthetic constant tensor (empty
+  // tensor_index_to_identifier map) and insert packed weights.
+  ASSERT_TRUE(cache_provider.StartBuildStep());
+  ASSERT_TRUE(cache_provider.MapTensorIdentifiers(
+      &tensor, /*size=*/1, /*tensor_index_to_identifier=*/{}));
+  xnn_weights_cache_t cache = &cache_provider.GetCacheProvider();
+  const xnn_weights_cache_look_up_key key{
+      .seed = 0x1234,
+      .kernel = shared_kernel,
+      .bias = nullptr,
+      .fingerprint_id = kDefaultFingerprint.id};
+  void* reserved = cache->reserve_space(cache, sizeof(shared_kernel));
+  ASSERT_NE(reserved, nullptr);
+  std::memcpy(reserved, shared_kernel, sizeof(shared_kernel));
+  const size_t offset_subgraph0 =
+      cache->look_up_or_insert(cache, &key, reserved, sizeof(shared_kernel));
+  ASSERT_NE(offset_subgraph0, SIZE_MAX);
+  ASSERT_TRUE(cache_provider.StopBuildStep());
+
+  // Subgraph 1 build step: 100% cache hit (nothing new written to cache).
+  ASSERT_TRUE(cache_provider.StartBuildStep());
+  ASSERT_TRUE(cache_provider.MapTensorIdentifiers(
+      &tensor, /*size=*/1, /*tensor_index_to_identifier=*/{}));
+  EXPECT_EQ(cache->look_up(cache, &key), offset_subgraph0);
+  ASSERT_TRUE(cache_provider.StopBuildStep());
+
+  // Subgraph 2 build step: must succeed because StopBuildStep() reset
+  // is_build_step_ even when Subgraph 1 had 0 new writes.
+  ASSERT_TRUE(cache_provider.StartBuildStep());
+  EXPECT_EQ(cache->look_up(cache, &key), offset_subgraph0);
+  ASSERT_TRUE(cache_provider.StopBuildStep());
 }
 
 }  // namespace

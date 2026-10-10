@@ -740,6 +740,38 @@ class Delegate {
     }
   }
 
+  void MaybeEnableDefaultInMemoryWeightCache(const tflite::Subgraph* subgraph) {
+    if (subgraph == nullptr || subgraph->GetSubgraphs() == nullptr ||
+        subgraph->GetSubgraphs()->size() <= 1) {
+      return;
+    }
+    if (options_.weights_cache != nullptr ||
+        options_.weight_cache_provider != nullptr ||
+        options_.weight_cache_file_path != nullptr ||
+        options_.weight_cache_file_descriptor > 0 ||
+        weight_cache_provider_->IsActive() ||
+        !weight_cache_provider_.owning() ||
+        !TfLiteXNNPackDelegateCanUseInMemoryWeightCacheProvider()) {
+      return;
+    }
+    if (weight_cache_provider_->LoadOrStartBuild(kInMemoryCachePath)) {
+      if (options_.weight_cache_lock_memory &&
+          !weight_cache_provider_->LockMemory()) {
+        TFLITE_LOG_PROD(tflite::TFLITE_LOG_ERROR,
+                        "XNNPack weight cache could not be locked in memory.");
+      }
+      options_.weights_cache =
+          reinterpret_cast<TfLiteXNNPackDelegateWeightsCache*>(
+              &weight_cache_provider_->GetCacheProvider());
+      options_.weight_cache_file_path =
+          weight_cache_provider_->GetFilePath().data();
+      TFLITE_LOG(tflite::TFLITE_LOG_VERBOSE,
+                 "XNNPack in-memory weight cache automatically enabled for "
+                 "multi-subgraph model (%zu subgraphs).",
+                 subgraph->GetSubgraphs()->size());
+    }
+  }
+
   ~Delegate() {
     if (workspace_mutex_ != nullptr && workspace_ != nullptr) {
       std::lock_guard<std::mutex> lock(*workspace_mutex_);
@@ -7252,6 +7284,7 @@ TfLiteIntArray* Delegate::PrepareOpsToDelegate(
     tflite::Subgraph* this_subgraph =
         reinterpret_cast<tflite::Subgraph*>(context->impl_);
     subgraph_index = this_subgraph->GetSubgraphIndex();
+    MaybeEnableDefaultInMemoryWeightCache(this_subgraph);
   }
   if (subgraph_index >= static_unpacked_data_.size()) {
     static_unpacked_data_.resize(subgraph_index + 1);
